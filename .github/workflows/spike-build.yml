@@ -74,14 +74,35 @@ jobs:
           corepack enable || npm i -g corepack
           yarn install --frozen-lockfile 2>&1 | tail -40 || yarn install 2>&1 | tail -40
 
-      - name: Build for aarch64-pc-windows-msvc
+      - name: Locate libclang (libSQL bindgen needs it)
+        shell: pwsh
+        run: |
+          $cands = Get-ChildItem -Path 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $cands) { $cands = Get-ChildItem -Path 'C:\Program Files\LLVM' -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if ($cands) {
+            Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$($cands.DirectoryName)"
+            Write-Host "LIBCLANG_PATH=$($cands.DirectoryName)"
+          } else {
+            Write-Host "::warning::libclang.dll not found; bindgen may fail (will surface in build)"
+          }
+
+      - name: Build for aarch64-pc-windows-msvc (decomposed; no fragile pipe, --target on cargo)
         working-directory: libsql-js
         shell: bash
         env:
           CARGO_TERM_COLOR: always
         run: |
-          set -o pipefail
-          yarn build --target aarch64-pc-windows-msvc 2>&1 | tee ../build.log | tail -250
+          set -eo pipefail
+          echo "--- tsc ---"
+          npx tsc
+          echo "--- cargo build (release, aarch64-pc-windows-msvc) ---"
+          # --target on CARGO (host is already aarch64 on windows-11-arm; explicit + rustup target added).
+          # Write JSON to a file instead of piping to neon (Windows pipe = os error 232).
+          cargo build --message-format=json --release --target aarch64-pc-windows-msvc \
+            1> ../cargo-build.json 2> ../cargo-stderr.log || { echo "CARGO FAILED:"; tail -80 ../cargo-stderr.log; exit 1; }
+          tail -20 ../cargo-stderr.log || true
+          echo "--- neon dist (from cargo json file; no --target) ---"
+          npm exec neon dist -- --name libsql-js < ../cargo-build.json 2>&1 | tee ../build.log | tail -120
 
       - name: Locate + verify index.node is ARM64
         working-directory: libsql-js
