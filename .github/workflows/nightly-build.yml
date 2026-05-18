@@ -1,0 +1,179 @@
+name: Nightly libsql Windows ARM64 Build
+
+# Builds Turso's libsql-js for aarch64-pc-windows-msvc and publishes a
+# per-version `@libsql/win32-arm64-msvc` Release (the platform package Turso
+# does not publish). Consumed by khairm/superset-windows-arm64.
+#
+# Change-gated: the nightly only builds when the libsql version it would build
+# is not already released here. workflow_dispatch can build a specific version
+# on demand (e.g. when superset resolves a libsql version not yet built).
+#
+# Deterministic: no source patch is required (we compile upstream libsql-js
+# unmodified and bypass `neon dist` — the built cdylib IS the Node addon once
+# renamed .node). See PATCHES.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      libsql_version:
+        description: libsql version to build (blank = latest on npm)
+        default: ""
+  schedule:
+    - cron: "30 0 * * *" # 00:30 UTC daily (after upstream/superset cadence)
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.c.outputs.should_build }}
+      version: ${{ steps.c.outputs.version }}
+    steps:
+      - name: Decide version + change-gate
+        id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REQ="${{ github.event.inputs.libsql_version }}"
+          if [ -n "$REQ" ]; then
+            V="$REQ"
+          else
+            V="$(npm view libsql version)"
+          fi
+          [ -n "$V" ] || { echo "could not determine libsql version"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if gh release view "$V" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "libsql $V already released here — skip"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "libsql $V not yet built — build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: windows-11-arm
+    steps:
+      - name: Checkout patches repo
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Ensure Rust (rust-toolchain.toml pins the toolchain)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
+            ./rustup-init.exe -y --default-toolchain none --profile minimal
+            Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
+          }
+
+      - name: Clone libsql-js @ version
+        shell: bash
+        run: |
+          V="${{ needs.check.outputs.version }}"
+          echo "Building libsql-js v$V"
+          git clone --depth 1 --branch "v$V" https://github.com/tursodatabase/libsql-js.git libsql-js
+
+      - name: Rust toolchain + target
+        working-directory: libsql-js
+        shell: bash
+        run: |
+          rustup show
+          rustup target add aarch64-pc-windows-msvc || true
+          rustc -vV
+
+      - name: Locate libclang (libSQL bindgen)
+        shell: pwsh
+        run: |
+          $c = Get-ChildItem -Path 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $c) { $c = Get-ChildItem -Path 'C:\Program Files\LLVM' -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if ($c) { Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$($c.DirectoryName)"; Write-Host "LIBCLANG_PATH=$($c.DirectoryName)" }
+          else { Write-Host "::warning::libclang.dll not found; bindgen may fail" }
+
+      - name: Cargo build (release, aarch64-pc-windows-msvc)
+        working-directory: libsql-js
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          set -eo pipefail
+          # Neon cdylib: the produced DLL IS the Node addon once renamed .node.
+          # Bypass the neon-rs 0.0.x CLI entirely (it rejects --target / breaks
+          # the Windows cargo|neon pipe).
+          cargo build --release --target aarch64-pc-windows-msvc 2> ../cargo-stderr.log \
+            || { echo "CARGO FAILED:"; tail -100 ../cargo-stderr.log; exit 1; }
+          ls -la "target/aarch64-pc-windows-msvc/release"/*.dll || true
+
+      - name: Package + verify @libsql/win32-arm64-msvc
+        working-directory: libsql-js
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $V = "${{ needs.check.outputs.version }}"
+          $rel = 'target\aarch64-pc-windows-msvc\release'
+          $dll = Join-Path $rel 'libsql_js.dll'
+          if (-not (Test-Path $dll)) {
+            $cand = Get-ChildItem "$rel\*.dll" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -notmatch '^(api-ms|vcruntime|msvcp|ucrtbase)' } |
+                    Sort-Object Length -Descending | Select-Object -First 1
+            if (-not $cand) { Write-Error "no cdylib .dll in $rel"; exit 1 }
+            $dll = $cand.FullName
+          }
+          $fs=[IO.File]::OpenRead($dll);$br=New-Object IO.BinaryReader($fs);$fs.Position=0x3C;$pe=$br.ReadInt32();$fs.Position=$pe+4;$m=$br.ReadUInt16();$br.Close()
+          if ($m -ne 0xAA64) { Write-Error "cdylib not ARM64 (0x$('{0:X}' -f $m))"; exit 1 }
+          $stage = "$env:GITHUB_WORKSPACE\stage"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item $dll "$stage\index.node" -Force
+          @"
+          {
+            "name": "@libsql/win32-arm64-msvc",
+            "version": "$V",
+            "os": ["win32"],
+            "cpu": ["arm64"],
+            "main": "index.node"
+          }
+          "@ | Set-Content "$stage\package.json"
+          # Definitive proof it is a loadable ARM64 Node addon.
+          node -e "require(process.argv[1]); console.log('ADDON LOADED OK')" "$stage\index.node"
+          if ($LASTEXITCODE -ne 0) { Write-Error "index.node failed to load"; exit 1 }
+          Get-ChildItem $stage
+
+      - name: Archive + checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf libsql-win32-arm64-msvc.tar.gz -C stage .
+          sha256sum libsql-win32-arm64-msvc.tar.gz > libsql-win32-arm64-msvc.tar.gz.sha256
+          cat libsql-win32-arm64-msvc.tar.gz.sha256
+
+      - name: Publish per-version Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ needs.check.outputs.version }}"
+          gh release delete "$V" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          git push --delete origin "refs/tags/$V" 2>/dev/null || true
+          gh release create "$V" \
+            libsql-win32-arm64-msvc.tar.gz \
+            libsql-win32-arm64-msvc.tar.gz.sha256 \
+            --repo "${{ github.repository }}" \
+            --title "libsql $V — @libsql/win32-arm64-msvc" \
+            --notes "Native Windows ARM64 build of [tursodatabase/libsql-js](https://github.com/tursodatabase/libsql-js) \`v$V\` (the \`@libsql/win32-arm64-msvc\` platform package Turso does not publish).
+
+          Tag = the libsql version. Consumed by [superset-windows-arm64](https://github.com/khairm/superset-windows-arm64).
+
+          **Assets:**
+          - \`libsql-win32-arm64-msvc.tar.gz\` — extract to get \`index.node\` + \`package.json\` (drop in as \`@libsql/win32-arm64-msvc\`)
+          - \`libsql-win32-arm64-msvc.tar.gz.sha256\`
+
+          Built deterministically (no upstream source patch). Not affiliated with Turso."
