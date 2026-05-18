@@ -1,0 +1,119 @@
+name: Spike - libsql Windows ARM64 build
+
+# Spike only: prove tursodatabase/libsql-js compiles for aarch64-pc-windows-msvc
+# on the native windows-11-arm runner and produces a loadable ARM64 index.node.
+# workflow_dispatch ONLY (never auto-runs). The real nightly (with a change-gate
+# that builds only when the needed libsql version changes) comes after this proves out.
+
+on:
+  workflow_dispatch:
+    inputs:
+      libsql_version:
+        description: libsql version to build (no leading v)
+        default: "0.5.22"
+
+jobs:
+  spike:
+    runs-on: windows-11-arm
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Ensure Rust (rust-toolchain.toml pins 1.88.0)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing rustup (aarch64)..."
+            Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
+            ./rustup-init.exe -y --default-toolchain none --profile minimal
+            Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
+          } else {
+            Write-Host "rustup present: $((Get-Command rustup).Source)"
+          }
+
+      - name: Clone libsql-js @ version
+        shell: bash
+        run: |
+          V="${{ github.event.inputs.libsql_version }}"
+          echo "Building libsql-js v$V"
+          git clone --depth 1 --branch "v$V" https://github.com/tursodatabase/libsql-js.git libsql-js
+          echo "LIBSQL_VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Rust toolchain + target
+        working-directory: libsql-js
+        shell: bash
+        run: |
+          rustup show
+          rustup target add aarch64-pc-windows-msvc || true
+          rustc -vV
+          cargo -V
+
+      - name: Patch neon.targets (add aarch64-pc-windows-msvc)
+        working-directory: libsql-js
+        shell: pwsh
+        run: |
+          $raw = Get-Content -Raw package.json
+          $p = $raw | ConvertFrom-Json
+          if (-not $p.neon) { Write-Error "no neon config in package.json"; exit 1 }
+          if (-not $p.neon.targets.'x86_64-pc-windows-msvc') {
+            Write-Error "expected x86_64-pc-windows-msvc mapping not present (upstream structure changed)"; exit 1
+          }
+          if (-not $p.neon.targets.'aarch64-pc-windows-msvc') {
+            $p.neon.targets | Add-Member -NotePropertyName 'aarch64-pc-windows-msvc' -NotePropertyValue '@libsql/win32-arm64-msvc'
+            ($p | ConvertTo-Json -Depth 64) | Set-Content -Path package.json -NoNewline
+            Write-Host "Added aarch64-pc-windows-msvc -> @libsql/win32-arm64-msvc"
+          }
+          (Get-Content -Raw package.json | ConvertFrom-Json).neon.targets | ConvertTo-Json
+
+      - name: Enable corepack + yarn install
+        working-directory: libsql-js
+        shell: bash
+        run: |
+          corepack enable || npm i -g corepack
+          yarn install --frozen-lockfile 2>&1 | tail -40 || yarn install 2>&1 | tail -40
+
+      - name: Build for aarch64-pc-windows-msvc
+        working-directory: libsql-js
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          set -o pipefail
+          yarn build --target aarch64-pc-windows-msvc 2>&1 | tee ../build.log | tail -250
+
+      - name: Locate + verify index.node is ARM64
+        working-directory: libsql-js
+        shell: pwsh
+        run: |
+          $n = Get-ChildItem -Recurse -Filter index.node -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $n) { Write-Error "No index.node produced"; exit 1 }
+          $fs=[IO.File]::OpenRead($n.FullName);$br=New-Object IO.BinaryReader($fs);$fs.Position=0x3C;$pe=$br.ReadInt32();$fs.Position=$pe+4;$m=$br.ReadUInt16();$br.Close()
+          $arch = if($m -eq 0xAA64){'ARM64'} elseif($m -eq 0x8664){'x64'} else {('0x{0:X}' -f $m)}
+          Write-Host "index.node: $($n.FullName)  size=$($n.Length)  arch=$arch"
+          if ($m -ne 0xAA64) { Write-Error "index.node is NOT ARM64 ($arch)"; exit 1 }
+          New-Item -ItemType Directory -Force ../artifact | Out-Null
+          Copy-Item $n.FullName ../artifact/index.node
+
+      - name: Package as @libsql/win32-arm64-msvc (proof of shape)
+        working-directory: libsql-js
+        shell: pwsh
+        run: |
+          $v = $env:LIBSQL_VERSION
+          $pkg = @{ name='@libsql/win32-arm64-msvc'; version=$v; main='index.node'; os=@('win32'); cpu=@('arm64') } | ConvertTo-Json
+          Set-Content -Path ../artifact/package.json -Value $pkg
+          Get-ChildItem ../artifact
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsql-win32-arm64-msvc
+          path: artifact/
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
